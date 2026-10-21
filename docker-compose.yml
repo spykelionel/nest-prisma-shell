@@ -1,0 +1,107 @@
+# Local development stack: dependencies only by default.
+#
+#   docker compose up -d                  # mongo + redis + minio
+#   docker compose --profile app up -d    # also the API and a worker, from the Dockerfile
+#
+# Not a production manifest: no auth on Mongo/Redis, default MinIO keys.
+
+services:
+  mongo:
+    image: mongo:7
+    # Prisma requires a replica set for writes; a single node is enough.
+    command: ['--replSet', 'rs0', '--bind_ip_all']
+    ports: ['27017:27017']
+    volumes: ['mongo-data:/data/db']
+    healthcheck:
+      # Initiates the replica set on first boot, then reports its status.
+      test:
+        [
+          'CMD',
+          'mongosh',
+          '--quiet',
+          '--eval',
+          "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] }).ok }",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    # AOF so queued jobs survive a restart.
+    command: ['redis-server', '--appendonly', 'yes']
+    ports: ['6379:6379']
+    volumes: ['redis-data:/data']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ['9000:9000', '9001:9001']
+    volumes: ['minio-data:/data']
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 minioadmin minioadmin &&
+                  mc mb --ignore-existing local/nestjs-base-local"
+
+  api:
+    profiles: ['app']
+    build: .
+    env_file: .env
+    environment:
+      SERVICE_NAME: nestjs-base-api
+      DATABASE_URL: mongodb://mongo:27017/nestjs_base?replicaSet=rs0&directConnection=true
+      REDIS_HOST: redis
+      STORAGE_ENDPOINT: http://minio:9000
+    ports: ['3000:3000']
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/health/live']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  worker:
+    profiles: ['app']
+    build: .
+    command: ['node', 'dist/main.worker.js']
+    # Only what the worker schema accepts: no DATABASE_URL, no JWT_SECRET.
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: nestjs-base-worker
+      REDIS_HOST: redis
+      QUEUE_PREFIX: nestjs-base-bull
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_REGION: us-east-1
+      STORAGE_BUCKET: nestjs-base-local
+      STORAGE_ACCESS_KEY_ID: minioadmin
+      STORAGE_SECRET_ACCESS_KEY: minioadmin
+      STORAGE_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+
+volumes:
+  mongo-data:
+  redis-data:
+  minio-data:

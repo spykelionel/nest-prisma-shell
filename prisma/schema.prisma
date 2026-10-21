@@ -1,0 +1,46 @@
+// MongoDB via Prisma.
+//
+// Prisma has no migrations for MongoDB: `npm run db:push` creates collections
+// and indexes. Prisma writes need a replica set (docker-compose runs a
+// single-node one).
+//
+// Conventions (see .claude/rules/mongodb-rules.md in the parent workspace):
+//   - every model has createdAt / updatedAt (the Mongoose timestamps:true equivalent)
+//   - every query path has an explicit @@index
+//   - references are @db.ObjectId
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// Example model. Delete it together with src/modules/notes.
+enum NoteStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Note {
+  id      String     @id @default(auto()) @map("_id") @db.ObjectId
+  // Subject of the JWT that created the note.
+  ownerId String     @db.ObjectId
+  title   String
+  body    String
+  status  NoteStatus @default(ACTIVE)
+
+  // Soft delete. Always written explicitly (null on create): on MongoDB,
+  // Prisma's `deletedAt: null` filter does not match a missing field.
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Owner listing: WHERE ownerId, deletedAt [, status] ORDER BY createdAt.
+  @@index([ownerId, deletedAt, createdAt])
+  @@index([ownerId, deletedAt, status, createdAt])
+  @@map("notes")
+}
